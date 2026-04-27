@@ -1,0 +1,1389 @@
+---
+title: "Reverse dosimetry report"
+output: pdf_document
+author: Lia Visintin
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8.5,
+  fig.height = 4.8,
+  dpi = 300,
+  dev = "png"
+)
+
+``` 
+
+First morning urine (FMU) samples were collected from 83 individuals selected from the INSEF-ExpoQuim survey (Gilles et al., 2022; Govarts et al., 2023) between May 2019-2020. Sample were analysed for the quantification of multiple mycotoxins, including tenuazonic acid (TA) and deoxynivalenol, that showed to be the most occurent mycotoxins in the cohort. The current script aims to analyse the risk connected with DON and TA exposure in terms of HQ based on the defined tollerable daily intake (TDI) and threshold of toxicological concert (TTC), respectively. The script uses urinary concentrations expressed both as ng/mL and ng/mg creatinine (crea). The risk is calculate considering the FMU both as representative for the daily excretion (FMU approach) or as fraction of the daily excretion (24h approach).
+
+```{r libraries, include = FALSE}
+
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(ggplot2)
+``` 
+
+## Data
+
+This chunk loads the dataset and applies the body-weight imputation for records with missing weight values. Modify "name.csv".
+
+```{r load-data}
+data <- read_csv("name.csv")
+df <- as.data.frame(data)
+missing_bw <- is.na(df$weight)
+
+df$weight[missing_bw] <- sapply(which(missing_bw), function(i) {
+  sex_i <- df$sex[i]
+  pool <- df$weight[df$sex == sex_i & !is.na(df$weight)]
+  sample(pool, 1, replace = TRUE)
+})
+
+head(data)
+colnames(data)
+```
+
+## Parameters 
+
+This chunk defines the simulation settings, risk thresholds, plotting colours, and the food-frequency variables used later in the correlation analysis.
+
+```{r parameters, echo=FALSE}
+set.seed(123)
+n_sim <- 10000
+TTC_TA <- 1500
+TDI_DON <- 1000
+
+approach_fill <- c(
+  "Crea 24h" = "#b8d8a8",
+  "Crea FMU" = "#9ed9df",
+  "FMU" = "#f6b6b2",
+  "24h" = "#cbb6e8"
+)
+
+input_fill <- c(
+  "Weight" = "#b8d8a8",
+  "TA imputed results" = "#9ed9df",
+  "DON imputed results" = "#f6b6b2",
+  "TA imputed creatinine" = "#9ed9df",
+  "DON imputed creatinine" = "#f6b6b2"
+)
+
+sex_fill <- c(
+  "Male" = "#9ed9df",
+  "Female" = "#f6b6b2"
+)
+
+food_vars <- c(
+  "vegetarian_fd", "meat_fd", "poultry_fd", "fruveg_fd", "organ_meat_fd",
+  "rice_fd", "hazel_fd", "butter_fd", "bread_fd", "cookie_fd",
+  "cheese_fd", "egg_fd", "fat_fd", "popcorn_fd", "potato_fried_fd",
+  "milk_drk", "beer", "alcohol"
+)
+
+food_groups <- list(
+  "Meat and animal foods" = c("meat_fd", "poultry_fd", "organ_meat_fd", "egg_fd"),
+  "Cereal-based foods" = c("rice_fd", "bread_fd", "cookie_fd", "popcorn_fd"),
+  "Dairy" = c("milk_drk", "cheese_fd", "butter_fd", "fat_fd"),
+  "Plant-based foods" = c("fruveg_fd", "hazel_fd", "vegetarian_fd"),
+  "Fried and smoked foods" = c("potato_fried_fd", "smoke_fd", "flame_fd"),
+  "Alcoholic drinks" = c("beer", "alcohol")
+)
+
+TTC_TA
+TDI_DON
+food_vars
+food_groups
+```
+
+## Helper functions
+
+This chunk defines the plotting helper and the simulation functions used for the FMU, 24h, and creatinine-adjusted approaches.
+
+```{r helper-functions, echo=FALSE}
+plot_theme <- function(base_size = 11) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      panel.grid.major = element_line(color = "grey90", linewidth = 0.35),
+      panel.grid.minor = element_line(color = "grey95", linewidth = 0.2),
+      strip.text = element_text(face = "plain", size = base_size - 1),
+      legend.position = "bottom",
+      legend.title = element_text(size = base_size - 1),
+      legend.text = element_text(size = base_size - 1),
+      axis.text = element_text(size = base_size - 1),
+      axis.title = element_text(size = base_size),
+      plot.title = element_text(size = base_size + 1)
+    )
+}
+
+save_plot <- function(filename, plot, width, height) {
+  ggsave(filename, plot, width = width, height = height, units = "cm", dpi = 300)
+}
+
+safe_spearman_test <- function(x, y) {
+  complete_idx <- complete.cases(x, y)
+  x_complete <- x[complete_idx]
+  y_complete <- y[complete_idx]
+
+  if (length(x_complete) < 3 || dplyr::n_distinct(x_complete) < 2 || dplyr::n_distinct(y_complete) < 2) {
+    return(list(estimate = NA_real_, p.value = NA_real_))
+  }
+
+  suppressWarnings(
+    cor.test(x_complete, y_complete, method = "spearman", exact = FALSE)
+  )
+}
+```
+
+## Simulation functions for input distributions and calculation of EDI
+
+This chunk defines the simulation functions used for the fraction excreted in urine (FUE), first morning urine volume (FMU), 24h urinary volume (24h), the estimated daily intake (edi) and their creatinine-adjusted equivalents (_crea).
+
+```{r input distributions, echo = FALSE}
+FUE_TA <- function(n) {
+  x <- rlnorm(n, log(0.212), log(1.49))
+  while (any(x > 1)) {
+    idx <- which(x > 1)
+    x[idx] <- rlnorm(length(idx), log(0.212), log(1.49))
+  }
+  x
+}
+
+FUE_DON <- function(n) {
+  mean <- 0.274
+  sd <- 0.118
+
+  meanlog <- log((mean^2) / sqrt(sd^2 + mean^2))
+  sdlog <- sqrt(log(1 + (sd^2 / mean^2)))
+
+  x <- rlnorm(n, meanlog, sdlog)
+  while (any(x > 1)) {
+    idx <- which(x > 1)
+    x[idx] <- rlnorm(length(idx), meanlog, sdlog)
+  }
+  x
+}
+
+simulate_FMU <- function(n, sex, max_val = 1000) {
+  if (sex == "Male") {
+    median <- 237
+    Q1 <- 181
+    Q3 <- 333
+  } else {
+    median <- 204
+    Q1 <- 53
+    Q3 <- 368
+  }
+
+  sdlog <- (log(Q3) - log(Q1)) / (2 * 0.674)
+  x <- rlnorm(n, log(median), sdlog)
+
+  while (any(x > max_val)) {
+    idx <- which(x > max_val)
+    x[idx] <- rlnorm(length(idx), log(median), sdlog)
+  }
+
+  x
+}
+
+simulate_24h <- function(n, sex, max_val = 6000) {
+  if (sex == "Male") {
+    median <- 1650
+    Q1 <- 1151
+    Q3 <- 2218
+  } else {
+    median <- 1620
+    Q1 <- 1000
+    Q3 <- 2500
+  }
+
+  sdlog <- (log(Q3) - log(Q1)) / (2 * 0.674)
+  x <- rlnorm(n, log(median), sdlog)
+
+  while (any(x > max_val)) {
+    idx <- which(x > max_val)
+    x[idx] <- rlnorm(length(idx), log(median), sdlog)
+  }
+
+  x
+}
+
+simulate_edi_FMU <- function(conc, BW, sex, FUE) {
+  V <- simulate_FMU(n_sim, sex)
+  fue <- FUE(n_sim)
+  (conc * V) / (fue * BW)
+}
+
+simulate_edi_24h <- function(conc, BW, sex, FUE) {
+  V_fmu <- simulate_FMU(n_sim, sex)
+  V_24h <- simulate_24h(n_sim, sex)
+  f_fmu <- V_fmu / V_24h
+  fue <- FUE(n_sim)
+  (conc * V_fmu) / (fue * f_fmu * BW)
+}
+
+simulate_edi_crea_24h <- function(conc, BW, FUE_dist, Crea_mean = 734, Crea_sd = 177) {
+  Crea_sim <- pmax(rnorm(n_sim, Crea_mean, Crea_sd), 0)
+  FUE_sim <- FUE_dist(n_sim)
+  (conc * Crea_sim) / (BW * FUE_sim)
+}
+
+simulate_edi_crea_FMU <- function(conc, BW, sex, FUE_dist, Crea_mean = 734, Crea_sd = 177) {
+  Crea_sim <- pmax(rnorm(n_sim, Crea_mean, Crea_sd), 0)
+  V_fmu <- simulate_FMU(n_sim, sex)
+  V_24h <- simulate_24h(n_sim, sex)
+  f_fmu <- pmin(V_fmu / V_24h, 1)
+  FUE_sim <- FUE_dist(n_sim)
+  (conc * Crea_sim * f_fmu) / (BW * FUE_sim)
+}
+```
+## Input distributions
+
+These chunks plot the input distributions of the two mycotoxins and the weight (after imputation of the NA), separately for the concentration expressed as ng/mL and ng/mg creatinine.
+
+```{r input violin volume, echo = FALSE}
+violin_data_volume <- df %>%
+  select(weight, ta_imputed_results, don_imputed_results) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "Variable",
+    values_to = "Value"
+  ) %>%
+  filter(!is.na(Value)) %>%
+  mutate(
+    Variable = factor(
+      Variable,
+      levels = c("weight", "ta_imputed_results", "don_imputed_results"),
+      labels = c("Weight", "TA imputed results", "DON imputed results")
+    )
+  )
+
+plot_selected_violins <- ggplot(
+  violin_data_volume,
+  aes(x = Variable, y = Value, fill = Variable)
+) +
+  scale_fill_manual(values = input_fill) +
+  geom_violin(alpha = 0.65, trim = TRUE, color = NA) +
+  geom_boxplot(
+    width = 0.22,
+    outlier.size = 0.25,
+    fill = scales::alpha("white", 0.45),
+    color = "black"
+  ) +
+  facet_wrap(~Variable, scales = "free_y") +
+  labs(
+    title = "Distribution of weight, TA and DON imputed concentrations",
+    x = NULL,
+    y = "ng/mL or kg (for weight)"
+  ) +
+  plot_theme(10.5) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+plot_selected_violins
+```
+
+```{r input violin crea, echo = FALSE}
+violin_data_crea <- df %>%
+  select(weight, ta_imputed_creatinine, don_imputed_creatinine) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "Variable",
+    values_to = "Value"
+  ) %>%
+  filter(!is.na(Value)) %>%
+  mutate(
+    Variable = factor(
+      Variable,
+      levels = c("weight", "ta_imputed_creatinine", "don_imputed_creatinine"),
+      labels = c("Weight", "TA imputed creatinine", "DON imputed creatinine")
+    )
+  )
+
+plot_selected_violins_crea <- ggplot(
+  violin_data_crea,
+  aes(x = Variable, y = Value, fill = Variable)
+) +
+  scale_fill_manual(values = input_fill) +
+  geom_violin(alpha = 0.65, trim = TRUE, color = NA) +
+  geom_boxplot(
+    width = 0.22,
+    outlier.size = 0.25,
+    fill = scales::alpha("white", 0.45),
+    color = "black"
+  ) +
+  facet_wrap(~Variable, scales = "free_y") +
+  labs(
+    title = "Distribution of weight, TA and DON imputed concentrations (creatinine-adjusted)",
+    x = NULL,
+    y = "Value"
+  ) +
+  plot_theme(10.5) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+plot_selected_violins_crea
+```
+## Monte Carlo simulation
+
+This chunck simulates the EDI and HQ using 4 different approachs for the two mycotoxins. The approaches differ for the urinary volume and the concentration used. The FMU simulated is used as representative for the whole day or as fraction of the 24h urinary excretion. The concentration is expressed as ng/mL (volume) or as ng/mg creatinine (crea).
+
+```{r monte-carlo-simulation, echo = FALSE}
+results_list_volume <- vector("list", nrow(df))
+results_list_crea <- vector("list", nrow(df))
+
+for (i in seq_len(nrow(df))) {
+  BW <- df$weight[i]
+  sex <- df$sex[i]
+
+  ta_fmu <- simulate_edi_FMU(df$ta_imputed_results[i], BW, sex, FUE_TA)
+  ta_24h <- simulate_edi_24h(df$ta_imputed_results[i], BW, sex, FUE_TA)
+  don_fmu <- simulate_edi_FMU(df$don_imputed_results[i], BW, sex, FUE_DON)
+  don_24h <- simulate_edi_24h(df$don_imputed_results[i], BW, sex, FUE_DON)
+
+  results_list_volume[[i]] <- bind_rows(
+    data.frame(ID = df$ID[i], Compound = "TA", Approach = "FMU", EDI = ta_fmu),
+    data.frame(ID = df$ID[i], Compound = "TA", Approach = "24h", EDI = ta_24h),
+    data.frame(ID = df$ID[i], Compound = "DON", Approach = "FMU", EDI = don_fmu),
+    data.frame(ID = df$ID[i], Compound = "DON", Approach = "24h", EDI = don_24h)
+  )
+
+  ta_crea_fmu <- simulate_edi_crea_FMU(df$ta_imputed_creatinine[i], BW, sex, FUE_TA)
+  ta_crea_24h <- simulate_edi_crea_24h(df$ta_imputed_creatinine[i], BW, FUE_TA)
+  don_crea_fmu <- simulate_edi_crea_FMU(df$don_imputed_creatinine[i], BW, sex, FUE_DON)
+  don_crea_24h <- simulate_edi_crea_24h(df$don_imputed_creatinine[i], BW, FUE_DON)
+
+  results_list_crea[[i]] <- bind_rows(
+    data.frame(ID = df$ID[i], Compound = "TA", Approach = "Crea FMU", EDI = ta_crea_fmu),
+    data.frame(ID = df$ID[i], Compound = "TA", Approach = "Crea 24h", EDI = ta_crea_24h),
+    data.frame(ID = df$ID[i], Compound = "DON", Approach = "Crea FMU", EDI = don_crea_fmu),
+    data.frame(ID = df$ID[i], Compound = "DON", Approach = "Crea 24h", EDI = don_crea_24h)
+  )
+}
+
+all_data_volume <- bind_rows(results_list_volume) %>%
+  mutate(
+    Threshold = ifelse(Compound == "TA", TTC_TA, TDI_DON),
+    HQ = EDI / Threshold,
+    Exceed = EDI > Threshold,
+    Approach = factor(Approach, levels = c("FMU", "24h"))
+  )
+
+all_data_crea <- bind_rows(results_list_crea) %>%
+  mutate(
+    Threshold = ifelse(Compound == "TA", TTC_TA, TDI_DON),
+    HQ = EDI / Threshold,
+    Exceed = EDI > Threshold,
+    Approach = factor(Approach, levels = c("Crea 24h", "Crea FMU"))
+  )
+
+all_data_all <- bind_rows(all_data_crea, all_data_volume) %>%
+  mutate(
+    Threshold = ifelse(Compound == "TA", TTC_TA, TDI_DON),
+    HQ = EDI / Threshold,
+    Exceed = EDI > Threshold,
+    Approach = factor(Approach, levels = c("Crea 24h", "Crea FMU", "FMU", "24h"))
+  )
+
+hq_summary_volume <- all_data_volume %>%
+  group_by(Compound, Approach) %>%
+  summarise(
+    Median_EDI = median(EDI),
+    Mean_EDI = mean(EDI),
+    P95_EDI = quantile(EDI, 0.95),
+    Median_HQ = median(HQ),
+    Mean_HQ = mean(HQ),
+    P95_HQ = quantile(HQ, 0.95),
+    Prob_HQ_above_1 = mean(Exceed),
+    Prob_HQ_above_1_percent = mean(Exceed) * 100,
+    .groups = "drop"
+  )
+
+hq_summary_crea <- all_data_crea %>%
+  group_by(Compound, Approach) %>%
+  summarise(
+    Median_EDI = median(EDI),
+    Mean_EDI = mean(EDI),
+    P95_EDI = quantile(EDI, 0.95),
+    Median_HQ = median(HQ),
+    Mean_HQ = mean(HQ),
+    P95_HQ = quantile(HQ, 0.95),
+    Prob_HQ_above_1 = mean(Exceed),
+    Prob_HQ_above_1_percent = mean(Exceed) * 100,
+    .groups = "drop"
+  )
+
+hq_summary_all <- all_data_all %>%
+  group_by(Compound, Approach) %>%
+  summarise(
+    Median_EDI = median(EDI),
+    Mean_EDI = mean(EDI),
+    P95_EDI = quantile(EDI, 0.95),
+    Median_HQ = median(HQ),
+    Mean_HQ = mean(HQ),
+    P95_HQ = quantile(HQ, 0.95),
+    Prob_HQ_above_1 = mean(Exceed),
+    Prob_HQ_above_1_percent = mean(Exceed) * 100,
+    .groups = "drop"
+  )
+
+hq_summary_all
+```
+
+## Volume-based plots
+
+These chuncks plot the EDI and HQ obtained for the FMU and 24h approaches using the concentration expressed in ng/mL.
+
+```{r plot-edi-volume, echo = FALSE}
+plot_comparison <- ggplot(
+  all_data_volume,
+  aes(x = Approach, y = EDI, fill = Approach)
+) +
+  scale_fill_manual(values = approach_fill) +
+  geom_violin(alpha = 0.65, trim = TRUE, color = NA) +
+  geom_boxplot(
+    width = 0.18,
+    outlier.size = 0.2,
+    fill = scales::alpha("white", 0.45),
+    color = "black"
+  ) +
+  facet_wrap(~Compound, scales = "free") +
+  geom_hline(
+    data = data.frame(Compound = c("TA", "DON"), ref = c(TTC_TA, TDI_DON)),
+    aes(yintercept = ref),
+    linetype = "dashed",
+    color = "red",
+    alpha = 0.7,
+    inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = data.frame(
+      Compound = c("TA", "DON"),
+      x = 1.5,
+      y = c(TTC_TA, TDI_DON),
+      label = c("TA TTC", "DON TDI")
+    ),
+    aes(x = x, y = y, label = label),
+    color = "red",
+    vjust = -0.4,
+    size = 3,
+    inherit.aes = FALSE
+  ) +
+  scale_y_log10() +
+  labs(
+    title = "Estimated daily intake (EDI): FMU vs 24h scaling",
+    y = "EDI (ng/kg/day)",
+    x = NULL
+  ) +
+  plot_theme(10.5)
+
+plot_comparison
+```
+
+```{r plot-hq-volume, echo = FALSE}
+plot_HQ <- ggplot(
+  all_data_volume,
+  aes(x = Approach, y = HQ, fill = Approach)
+) +
+  scale_fill_manual(values = approach_fill) +
+  geom_violin(alpha = 0.65, trim = TRUE, color = NA) +
+  geom_boxplot(
+    width = 0.18,
+    outlier.size = 0.2,
+    fill = scales::alpha("white", 0.45),
+    color = "black"
+  ) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red", alpha = 0.7) +
+  geom_text(
+    data = data.frame(
+      Compound = c("TA", "DON"),
+      x = c(1.5, 1.5),
+      y = c(1, 1),
+      label = c("HQ_TTC = 1", "HQ = 1")
+    ),
+    aes(x = x, y = y, label = label),
+    color = "red",
+    vjust = -0.4,
+    size = 3,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~Compound, scales = "free") +
+  scale_y_log10() +
+  labs(
+    title = "Hazard quotient (HQ) distribution",
+    y = "HQ",
+    x = NULL
+  ) +
+  plot_theme(10.5)
+
+plot_HQ
+```
+
+## Creatinine-based plots
+
+These chuncks plot the EDI and HQ obtained for the FMU and 24h approaches using the concentration expressed in ng/mg creatinine.
+
+```{r plot-edi-crea, echo = FALSE}
+plot_comparison_crea <- ggplot(
+  all_data_crea,
+  aes(x = Approach, y = EDI, fill = Approach)
+) +
+  scale_fill_manual(values = approach_fill) +
+  geom_violin(alpha = 0.65, trim = TRUE, color = NA) +
+  geom_boxplot(
+    width = 0.18,
+    outlier.size = 0.2,
+    fill = scales::alpha("white", 0.45),
+    color = "black"
+  ) +
+  facet_wrap(~Compound, scales = "free") +
+  geom_hline(
+    data = data.frame(Compound = c("TA", "DON"), ref = c(TTC_TA, TDI_DON)),
+    aes(yintercept = ref),
+    linetype = "dashed",
+    color = "red",
+    alpha = 0.7,
+    inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = data.frame(
+      Compound = c("TA", "DON"),
+      x = 1.5,
+      y = c(TTC_TA, TDI_DON),
+      label = c("TA TTC", "DON TDI")
+    ),
+    aes(x = x, y = y, label = label),
+    color = "red",
+    vjust = -0.4,
+    size = 3,
+    inherit.aes = FALSE
+  ) +
+  scale_y_log10() +
+  labs(
+    title = "Estimated daily intake (EDI): creatinine FMU vs creatinine 24h",
+    y = "EDI (ng/kg/day)",
+    x = NULL
+  ) +
+  plot_theme(10.5)
+
+plot_comparison_crea
+```
+
+```{r plot-hq-crea, echo = FALSE}
+plot_HQ_crea <- ggplot(
+  all_data_crea,
+  aes(x = Approach, y = HQ, fill = Approach)
+) +
+  scale_fill_manual(values = approach_fill) +
+  geom_violin(alpha = 0.65, trim = TRUE, color = NA) +
+  geom_boxplot(
+    width = 0.18,
+    outlier.size = 0.2,
+    fill = scales::alpha("white", 0.45),
+    color = "black"
+  ) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red", alpha = 0.7) +
+  geom_text(
+    data = data.frame(
+      Compound = c("TA", "DON"),
+      x = c(1.5, 1.5),
+      y = c(1, 1),
+      label = c("HQ_TTC = 1", "HQ = 1")
+    ),
+    aes(x = x, y = y, label = label),
+    color = "red",
+    vjust = -0.4,
+    size = 3,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~Compound, scales = "free") +
+  scale_y_log10() +
+  labs(
+    title = "Hazard Quotient (HQ): creatinine FMU vs creatinine 24h",
+    y = "HQ",
+    x = NULL
+  ) +
+  plot_theme(10.5)
+
+plot_HQ_crea
+```
+
+## Simulated input distributions used in Monte Carlo
+
+This chunck plots the previously simulated input distributions used in the Monte Carlo risk analysis. 
+
+```{r plot-inputs, echo = FALSE}
+input_data <- data.frame(
+  Value = c(
+    simulate_FMU(10000, "Male"),
+    simulate_FMU(10000, "Female"),
+    simulate_24h(10000, "Male"),
+    simulate_24h(10000, "Female"),
+    pmax(rnorm(10000, 734, 177), 0),
+    FUE_TA(10000),
+    FUE_DON(10000)
+  ),
+  Type = rep(
+    c(
+      "FMU_Male",
+      "FMU_Female",
+      "24h_Male",
+      "24h_Female",
+      "Daily_creatinine_excretion",
+      "FUE_TA",
+      "FUE_DON"
+    ),
+    each = 10000
+  )
+)
+
+plot_inputs <- ggplot(input_data, aes(x = Value)) +
+  geom_density(fill = "#b8d8a8", alpha = 0.65, color = NA) +
+  facet_wrap(~Type, scales = "free") +
+  labs(
+    title = "Input distributions used in Monte Carlo risk analysis",
+    x = "Value",
+    y = "Density"
+  ) +
+  plot_theme(10)
+
+plot_inputs
+```
+
+## Distribution of f_FMU (FMU/24h ratio)
+
+This chunck plots the f_FMU (FMU/24h ratio) for males and females. 
+
+```{r plot-f-fmu, echo = FALSE}
+f_data <- data.frame(
+  f_FMU = c(
+    simulate_FMU(10000, "Male") / simulate_24h(10000, "Male"),
+    simulate_FMU(10000, "Female") / simulate_24h(10000, "Female")
+  ),
+  Sex = rep(c("Male", "Female"), each = 10000)
+)
+
+f_data$f_FMU[f_data$f_FMU > 1] <- 1
+
+plot_f <- ggplot(f_data, aes(x = f_FMU, fill = Sex)) +
+  scale_fill_manual(values = sex_fill) +
+  geom_density(alpha = 0.6, color = NA) +
+  labs(
+    title = "Distribution of f_FMU (FMU/24h ratio)",
+    x = "f_FMU",
+    y = "Density"
+  ) +
+  plot_theme(10.5)
+
+plot_f
+```
+
+## Comparison across all four approaches
+
+These chucks create a plot for the comparison of the EDI and HQ obtained with the 4 different approaches.
+
+```{r plot-edi-all, fig.width=10.5, fig.height=4.8, echo = FALSE}
+plot_comparison_all <- ggplot(
+  all_data_all,
+  aes(x = Approach, y = EDI, fill = Approach)
+) +
+  scale_fill_manual(values = approach_fill) +
+  geom_violin(alpha = 0.65, trim = TRUE, color = NA) +
+  geom_boxplot(
+    width = 0.16,
+    outlier.size = 0.18,
+    fill = scales::alpha("white", 0.45),
+    color = "black"
+  ) +
+  facet_wrap(~Compound, scales = "free") +
+  geom_hline(
+    data = data.frame(Compound = c("TA", "DON"), ref = c(TTC_TA, TDI_DON)),
+    aes(yintercept = ref),
+    linetype = "dashed",
+    color = "red",
+    alpha = 0.7,
+    inherit.aes = FALSE
+  ) +
+  geom_text(
+    data = data.frame(
+      Compound = c("TA", "DON"),
+      x = 2.5,
+      y = c(TTC_TA, TDI_DON),
+      label = c("TA TTC", "DON TDI")
+    ),
+    aes(x = x, y = y, label = label),
+    color = "red",
+    vjust = -0.35,
+    size = 2.8,
+    inherit.aes = FALSE
+  ) +
+  scale_y_log10() +
+  labs(
+    title = "Estimated daily intake (EDI) across all approaches",
+    y = "EDI (ng/kg/day)",
+    x = NULL
+  ) +
+  plot_theme(9.5) +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
+
+plot_comparison_all
+```
+
+```{r plot-hq-all, fig.width=10.5, fig.height=4.8, echo = FALSE}
+plot_HQ_all <- ggplot(
+  all_data_all,
+  aes(x = Approach, y = HQ, fill = Approach)
+) +
+  scale_fill_manual(values = approach_fill) +
+  geom_violin(alpha = 0.65, trim = TRUE, color = NA) +
+  geom_boxplot(
+    width = 0.16,
+    outlier.size = 0.18,
+    fill = scales::alpha("white", 0.45),
+    color = "black"
+  ) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red", alpha = 0.7) +
+  geom_text(
+    data = data.frame(
+      Compound = c("TA", "DON"),
+      x = c(2.5, 2.5),
+      y = c(1, 1),
+      label = c("HQ_TTC = 1", "HQ = 1")
+    ),
+    aes(x = x, y = y, label = label),
+    color = "red",
+    vjust = -0.35,
+    size = 2.8,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~Compound, scales = "free") +
+  scale_y_log10() +
+  labs(
+    title = "Hazard quotient (HQ) across all approaches",
+    y = "HQ",
+    x = NULL
+  ) +
+  plot_theme(9.5) +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
+
+plot_HQ_all
+```
+
+## Correlation between food intake and HQ
+
+This chunk summarises each participant's median HQ for the volume-based 24h approach for TA and DON, and then calculates the correlations with the main food-frequency variables and adjusted p-values. Positive correlations indicate that higher intake frequency tends to be associated with higher HQ. Since food intake variables are ordinal or semi-quantitative frequency variables, not continuous measurements, Spearman correlation was used.
+
+```{r hq-food-correlation, fig.width=9.5, fig.height=6.5, echo=FALSE}
+individual_hq <- all_data_all %>%
+  group_by(ID, Compound, Approach) %>%
+  summarise(HQ_median = median(HQ), .groups = "drop")
+
+hq_for_corr <- individual_hq %>%
+  filter(Approach == "24h") %>%
+  mutate(HQ_type = if_else(Compound == "TA", "HQ_TTC TA", "HQ DON")) %>%
+  select(ID, HQ_type, HQ_median) %>%
+  pivot_wider(names_from = HQ_type, values_from = HQ_median)
+
+food_corr_data <- df %>%
+  select(ID, all_of(food_vars)) %>%
+  left_join(hq_for_corr, by = "ID")
+
+correlation_results <- expand_grid(
+  food_var = food_vars,
+  HQ_type = c("HQ_TTC TA", "HQ DON")
+) %>%
+  rowwise() %>%
+  mutate(
+    cor_test = list(
+      safe_spearman_test(
+        food_corr_data[[food_var]],
+        food_corr_data[[HQ_type]]
+      )
+    ),
+    spearman_rho = suppressWarnings(
+      unname(cor_test$estimate)
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    p_value = map_dbl(cor_test, "p.value"),
+    p_value_adj = p.adjust(p_value, method = "BH")
+  ) %>%
+  select(-cor_test)
+
+correlation_heatmap_data <- correlation_results %>%
+  mutate(
+    food_label = str_replace_all(food_var, "_", " "),
+    food_label = str_replace_all(food_label, "fd", "frequency"),
+    food_label = str_replace_all(food_label, "drk", "drink"),
+    signif_label = case_when(
+      p_value_adj < 0.001 ~ "***",
+      p_value_adj < 0.01 ~ "**",
+      p_value_adj < 0.05 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+food_order <- correlation_heatmap_data %>%
+  group_by(food_label) %>%
+  summarise(mean_abs_rho = mean(abs(spearman_rho), na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(mean_abs_rho)) %>%
+  pull(food_label)
+
+correlation_heatmap_data <- correlation_heatmap_data %>%
+  mutate(food_label = factor(food_label, levels = rev(food_order)))
+
+plot_hq_food_correlation <- ggplot(
+  correlation_heatmap_data,
+  aes(x = HQ_type, y = food_label, fill = spearman_rho)
+) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(aes(label = paste0(sprintf("%.2f", spearman_rho), signif_label)), size = 2.6) +
+  scale_fill_gradient2(
+    low = "#fd4f43",
+    mid = "white",
+    high = "#8cc96e",
+    midpoint = 0,
+    limits = c(-1, 1),
+    name = "Spearman rho"
+  ) +
+  labs(
+    title = "Correlation between food intake frequency and HQ",
+    x = NULL,
+    y = NULL
+  ) +
+  plot_theme(10) +
+  theme(
+    axis.text.y = element_text(size = 8.5),
+    legend.position = "right"
+  )
+
+plot_hq_food_correlation
+```
+
+## Correlation between grouped food intake and HQ
+
+This chunk combines related foods into broader food groups, then calculates Spearman correlations and adjusted p-values for the grouped scores against HQ for TA and DON.
+
+```{r grouped-food-correlation, fig.width=8.5, fig.height=4.8, echo=FALSE}
+food_group_scores <- map_dfc(food_groups, function(cols) {
+  score <- rowMeans(df[, cols], na.rm = TRUE)
+  score[rowSums(!is.na(df[, cols])) == 0] <- NA_real_
+  tibble(score = score)
+}) %>%
+  setNames(names(food_groups))
+
+food_group_data <- bind_cols(
+  df %>% select(ID),
+  food_group_scores
+) %>%
+  left_join(hq_for_corr, by = "ID")
+
+grouped_correlation_results <- expand_grid(
+  food_group = names(food_groups),
+  HQ_type = c("HQ_TTC TA", "HQ DON")
+) %>%
+  rowwise() %>%
+  mutate(
+    cor_test = list(
+      safe_spearman_test(
+        food_group_data[[food_group]],
+        food_group_data[[HQ_type]]
+      )
+    ),
+    spearman_rho = suppressWarnings(unname(cor_test$estimate))
+  ) %>%
+  ungroup() %>%
+  mutate(
+    p_value = map_dbl(cor_test, "p.value"),
+    p_value_adj = p.adjust(p_value, method = "BH"),
+    signif_label = case_when(
+      p_value_adj < 0.001 ~ "***",
+      p_value_adj < 0.01 ~ "**",
+      p_value_adj < 0.05 ~ "*",
+      TRUE ~ ""
+    )
+  ) %>%
+  select(-cor_test)
+
+plot_grouped_food_correlation <- ggplot(
+  grouped_correlation_results,
+  aes(x = HQ_type, y = food_group, fill = spearman_rho)
+) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(aes(label = paste0(sprintf("%.2f", spearman_rho), signif_label)), size = 3) +
+  scale_fill_gradient2(
+    low = "#fd4f43",
+    mid = "white",
+    high = "#8cc96e",
+    midpoint = 0,
+    limits = c(-1, 1),
+    name = "Spearman rho"
+  ) +
+  labs(
+    title = "Correlation between grouped food intake and HQ",
+    x = NULL,
+    y = NULL
+  ) +
+  plot_theme(10) +
+  theme(legend.position = "right")
+
+plot_grouped_food_correlation
+```
+
+## At-risk subgroups
+
+This chunk recodes the main demographic and anthropometric variables and identifies potentially at-risk subgroups based on the median HQ from the volume-based 24h approach. For categorical variables, distribution differences are tested between groups with Wilcoxon or Kruskal-Wallis tests. For age, Spearman correlation is used.
+
+```{r subgroup-risk-analysis, fig.width=10, fig.height=7, echo=FALSE}
+subgroup_data <- df %>%
+  mutate(
+    sex_group = case_when(
+      sex == 0 ~ "Female",
+      sex == 1 ~ "Male",
+      TRUE ~ NA_character_
+    ),
+    isced_group = case_when(
+      isced == 1 ~ "Low",
+      isced == 2 ~ "Medium",
+      isced == 3 ~ "High",
+      TRUE ~ NA_character_
+    ),
+    degurba_group = case_when(
+      degurba == 1 ~ "Cities",
+      degurba == 2 ~ "Towns and suburbs",
+      degurba == 3 ~ "Rural areas",
+      TRUE ~ NA_character_
+    ),
+    nuts2_group = case_when(
+      is.na(nuts2) ~ NA_character_,
+      TRUE ~ paste("NUTS2", nuts2)
+    ),
+    occ_group = case_when(
+      occ_s == 0 ~ "occ_s = 0",
+      occ_s == 1 ~ "occ_s = 1",
+      TRUE ~ NA_character_
+    ),
+    bmi = weight / ((height / 100) ^ 2),
+    bmi_group = case_when(
+      bmi < 18.5 ~ "Underweight",
+      bmi >= 18.5 & bmi < 25 ~ "Normal weight",
+      bmi >= 25 & bmi < 30 ~ "Overweight",
+      bmi >= 30 ~ "Obesity",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(
+    ID, ageyears, sex_group, isced_group, degurba_group,
+    nuts2_group, occ_group, bmi, bmi_group
+  )
+
+subgroup_hq_data <- hq_for_corr %>%
+  left_join(subgroup_data, by = "ID")
+
+categorical_subgroups <- c(
+  "sex_group", "isced_group", "degurba_group",
+  "nuts2_group", "occ_group", "bmi_group"
+)
+
+subgroup_risk_summary <- subgroup_hq_data %>%
+  pivot_longer(
+    cols = all_of(categorical_subgroups),
+    names_to = "subgroup_variable",
+    values_to = "subgroup_level"
+  ) %>%
+  filter(!is.na(subgroup_level)) %>%
+  pivot_longer(
+    cols = c(`HQ_TTC TA`, `HQ DON`),
+    names_to = "HQ_type",
+    values_to = "high_HQ"
+  ) %>%
+  group_by(subgroup_variable, subgroup_level, HQ_type) %>%
+  summarise(
+    n = n(),
+    median_high_HQ = median(high_HQ, na.rm = TRUE),
+    mean_high_HQ = mean(high_HQ, na.rm = TRUE),
+    prob_exceed_1 = mean(high_HQ > 1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    subgroup_variable = recode(
+      subgroup_variable,
+      sex_group = "Sex",
+      isced_group = "Education level",
+      degurba_group = "Degree of urbanization",
+      nuts2_group = "NUTS2 region",
+      occ_group = "Occupation",
+      bmi_group = "BMI group"
+    )
+  )
+
+subgroup_test_summary <- map_dfr(categorical_subgroups, function(var_name) {
+  map_dfr(c("HQ_TTC TA", "HQ DON"), function(hq_name) {
+    tmp <- subgroup_hq_data %>%
+      select(group = all_of(var_name), value = all_of(hq_name)) %>%
+      filter(!is.na(group), !is.na(value))
+
+    n_groups <- dplyr::n_distinct(tmp$group)
+
+    if (n_groups < 2) {
+      tibble(
+        subgroup_variable = var_name,
+        HQ_type = hq_name,
+        method = NA_character_,
+        statistic = NA_real_,
+        p_value = NA_real_
+      )
+    } else if (n_groups == 2) {
+      test_res <- wilcox.test(value ~ group, data = tmp)
+      tibble(
+        subgroup_variable = var_name,
+        HQ_type = hq_name,
+        method = "Wilcoxon rank-sum",
+        statistic = unname(test_res$statistic),
+        p_value = test_res$p.value
+      )
+    } else {
+      test_res <- kruskal.test(value ~ group, data = tmp)
+      tibble(
+        subgroup_variable = var_name,
+        HQ_type = hq_name,
+        method = "Kruskal-Wallis",
+        statistic = unname(test_res$statistic),
+        p_value = test_res$p.value
+      )
+    }
+  })
+}) %>%
+  mutate(
+    p_value_adj = p.adjust(p_value, method = "BH"),
+    subgroup_variable = recode(
+      subgroup_variable,
+      sex_group = "Sex",
+      isced_group = "Education level",
+      degurba_group = "Degree of urbanization",
+      nuts2_group = "NUTS2 region",
+      occ_group = "Occupation",
+      bmi_group = "BMI group"
+    )
+  )
+
+age_test_summary <- map_dfr(c("HQ_TTC TA", "HQ DON"), function(hq_name) {
+  tmp <- subgroup_hq_data %>%
+    select(ageyears, value = all_of(hq_name)) %>%
+    filter(!is.na(ageyears), !is.na(value))
+
+  test_res <- suppressWarnings(
+    cor.test(tmp$ageyears, tmp$value, method = "spearman", exact = FALSE)
+  )
+
+  tibble(
+    subgroup_variable = "Age",
+    HQ_type = hq_name,
+    method = "Spearman correlation",
+    statistic = unname(test_res$estimate),
+    p_value = test_res$p.value
+  )
+}) %>%
+  mutate(p_value_adj = p.adjust(p_value, method = "BH"))
+
+subgroup_significance_summary <- bind_rows(subgroup_test_summary, age_test_summary) %>%
+  mutate(
+    signif_label = case_when(
+      p_value_adj < 0.001 ~ "***",
+      p_value_adj < 0.01 ~ "**",
+      p_value_adj < 0.05 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+plot_subgroup_risk <- ggplot(
+  subgroup_risk_summary,
+  aes(x = HQ_type, y = subgroup_level, fill = prob_exceed_1)
+) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(aes(label = sprintf("%.1f%%", prob_exceed_1 * 100)), size = 2.7) +
+  scale_fill_gradient(
+    low = "white",
+    high = "#8cc96e",
+    name = "Probability of HQ > 1"
+  ) +
+  facet_wrap(~subgroup_variable, scales = "free_y") +
+  labs(
+    title = "Probability of HQ > 1 across demographic and anthropometric subgroups",
+    x = NULL,
+    y = NULL
+  ) +
+  plot_theme(9.5) +
+  theme(
+    axis.text.y = element_text(size = 7.8),
+    legend.position = "right"
+  )
+
+plot_subgroup_risk
+```
+
+## Adjusted regression models for HQ
+
+This chunk fits adjusted regression models for each mycotoxin using the same subgroup variables considered above. Linear regression is applied to `log(HQ)`, while logistic regression is applied to the binary outcome `HQ > 1`.
+
+### Interpretation
+The linear regression model estimates how each variable is associated with an increased of decresed HQ. For example, an estimate = 0.69 (exp(0.69) = 2.0) means about 2 times higher HQ, while an estimate = -0.69 means about 2 times lower HQ. 
+The logistic regression model estimates how each variable is associated with the odds of exceeding the risk threshold. For example, an estimate = 1.10 for age, means that each one-unit increase in age increases the odds by 10%. Coefficients equal to zero or extremely high should be interpreted as unstable and unreliable, due to a low sample size for the specific subgroup.
+
+The p-values are the significance test for the coefficients. The null hypothesis is represented by a coefficient = 0, meaning no association with log(HQ) or with odds of HQ >1.
+
+```{r adjusted-regression-models, echo=FALSE}
+regression_data <- subgroup_hq_data %>%
+  pivot_longer(
+    cols = c(`HQ_TTC TA`, `HQ DON`),
+    names_to = "HQ_type",
+    values_to = "high_HQ"
+  ) %>%
+  mutate(
+    HQ_type = factor(HQ_type, levels = c("HQ_TTC TA", "HQ DON")),
+    log_high_HQ = log(high_HQ),
+    exceed_1 = high_HQ > 1,
+    sex_group = factor(sex_group),
+    isced_group = factor(isced_group, levels = c("Low", "Medium", "High")),
+    degurba_group = factor(degurba_group),
+    nuts2_group = factor(nuts2_group),
+    occ_group = factor(occ_group),
+    bmi_group = factor(bmi_group, levels = c("Underweight", "Normal weight", "Overweight", "Obesity"))
+  )
+
+extract_model_table <- function(model, exponentiate = FALSE) {
+  model_summary <- summary(model)$coefficients
+  out <- as.data.frame(model_summary)
+  out$term <- rownames(out)
+  rownames(out) <- NULL
+
+  if (exponentiate) {
+    out <- out %>%
+      transmute(
+        term = term,
+        estimate = exp(Estimate),
+        std_error = `Std. Error`,
+        statistic = `z value`,
+        p_value = `Pr(>|z|)`,
+        percent_change = (exp(Estimate) - 1) * 100
+      )
+  } else {
+    out <- out %>%
+      transmute(
+        term = term,
+        estimate = Estimate,
+        std_error = `Std. Error`,
+        statistic = `t value`,
+        p_value = `Pr(>|t|)`,
+        exp_estimate = exp(Estimate),
+        percent_change = (exp(Estimate) - 1) * 100
+      )
+  }
+
+  out %>%
+    mutate(
+      signif_label = case_when(
+        p_value < 0.001 ~ "***",
+        p_value < 0.01 ~ "**",
+        p_value < 0.05 ~ "*",
+        TRUE ~ ""
+      )
+    )
+}
+
+lm_results <- map_dfr(levels(regression_data$HQ_type), function(hq_name) {
+  model_df <- regression_data %>%
+    filter(HQ_type == hq_name) %>%
+    select(
+      log_high_HQ, ageyears, sex_group, isced_group, degurba_group,
+      nuts2_group, occ_group, bmi_group
+    ) %>%
+    drop_na()
+
+  model_fit <- lm(
+    log_high_HQ ~ ageyears + sex_group + isced_group + degurba_group +
+      nuts2_group + occ_group + bmi_group,
+    data = model_df
+  )
+
+  extract_model_table(model_fit, exponentiate = FALSE) %>%
+    mutate(
+      HQ_type = hq_name,
+      model = "Linear regression on log(HQ)"
+    )
+})
+
+glm_results <- map_dfr(levels(regression_data$HQ_type), function(hq_name) {
+  model_df <- regression_data %>%
+    filter(HQ_type == hq_name) %>%
+    select(
+      exceed_1, ageyears, sex_group, isced_group, degurba_group,
+      nuts2_group, occ_group, bmi_group
+    ) %>%
+    drop_na()
+
+  if (length(unique(model_df$exceed_1)) < 2) {
+    return(tibble(
+      term = NA_character_,
+      estimate = NA_real_,
+      std_error = NA_real_,
+      statistic = NA_real_,
+      p_value = NA_real_,
+      HQ_type = hq_name,
+      model = "Logistic regression on HQ > 1"
+    ))
+  }
+
+  model_fit <- glm(
+    exceed_1 ~ ageyears + sex_group + isced_group + degurba_group +
+      nuts2_group + occ_group + bmi_group,
+    data = model_df,
+    family = binomial()
+  )
+
+  extract_model_table(model_fit, exponentiate = TRUE) %>%
+    mutate(
+      HQ_type = hq_name,
+      model = "Logistic regression on HQ > 1"
+    )
+})
+
+print("Results linear regression")
+lm_results
+
+print("Results logistic regression")
+glm_results
+```
+
+## Summary tables
+
+```{r summary-tables, echo=FALSE}
+hq_summary_volume
+hq_summary_crea
+hq_summary_all
+correlation_heatmap_data %>%
+  select(HQ_type, food_label, spearman_rho, p_value, p_value_adj) %>%
+  arrange(HQ_type, p_value_adj)
+
+grouped_correlation_results %>%
+  select(HQ_type, food_group, spearman_rho, p_value, p_value_adj) %>%
+  arrange(HQ_type, p_value_adj)
+
+subgroup_significance_summary
+
+subgroup_risk_summary %>%
+  arrange(HQ_type, desc(median_high_HQ))
+
+lm_results %>%
+  select(HQ_type, model, term, estimate, exp_estimate, percent_change, p_value, signif_label)
+
+glm_results %>%
+  select(HQ_type, model, term, estimate, percent_change, p_value, signif_label)
+```
+
+## Save outputs
+
+This chunk creates an `outputs` folder and saves all summary tables and figures generated in the report in one place.
+
+```{r save-outputs, echo=FALSE}
+dir.create("outputs", showWarnings = FALSE, recursive = TRUE)
+
+save_plot("outputs/violin_weight_ta_don.png", plot_selected_violins, 18, 12)
+save_plot("outputs/violin_weight_ta_don_crea.png", plot_selected_violins_crea, 18, 12)
+save_plot("outputs/comparison_FMU_24h.png", plot_comparison, 18, 10)
+save_plot("outputs/HQ_distribution.png", plot_HQ, 18, 10)
+save_plot("outputs/comparison_crea_FMU_24h.png", plot_comparison_crea, 18, 10)
+save_plot("outputs/HQ_distribution_crea.png", plot_HQ_crea, 18, 10)
+save_plot("outputs/input_distributions_crea.png", plot_inputs, 18, 12)
+save_plot("outputs/f_FMU_distribution.png", plot_f, 16, 9)
+save_plot("outputs/comparison_all_approaches_EDI.png", plot_comparison_all, 24, 10)
+save_plot("outputs/comparison_all_approaches_HQ.png", plot_HQ_all, 24, 10)
+save_plot("outputs/hq_food_correlation_heatmap.png", plot_hq_food_correlation, 20, 18)
+save_plot("outputs/grouped_food_correlation_heatmap.png", plot_grouped_food_correlation, 18, 12)
+save_plot("outputs/subgroup_risk_heatmap.png", plot_subgroup_risk, 24, 18)
+
+write.table(
+  hq_summary_volume,
+  file = "outputs/HQ_summary.txt",
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+write.table(
+  hq_summary_crea,
+  file = "outputs/HQ_summary_crea.txt",
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+write.table(
+  hq_summary_all,
+  file = "outputs/HQ_summary_all_approaches.txt",
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+write.table(
+  correlation_results,
+  file = "outputs/food_correlation_results.txt",
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+write.table(
+  grouped_correlation_results,
+  file = "outputs/grouped_food_correlation_results.txt",
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+write.table(
+  subgroup_significance_summary,
+  file = "outputs/subgroup_significance_results.txt",
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+write.table(
+  subgroup_risk_summary,
+  file = "outputs/subgroup_risk_summary.txt",
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+write.table(
+  lm_results,
+  file = "outputs/logHQ_regression_results.txt",
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+write.table(
+  glm_results,
+  file = "outputs/HQ_exceedance_logistic_results.txt",
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+```
