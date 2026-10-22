@@ -152,6 +152,7 @@ FUE_TA <- function(n) {
 }
 
 FUE_DON <- function(n) {
+  total_urinary_recovery <- 0.64
   mean <- 0.274
   sd <- 0.118
 
@@ -163,7 +164,8 @@ FUE_DON <- function(n) {
     idx <- which(x > 1)
     x[idx] <- rlnorm(length(idx), meanlog, sdlog)
   }
-  x
+
+  total_urinary_recovery * x
 }
 
 simulate_FMU <- function(n, sex, max_val = 1000) {
