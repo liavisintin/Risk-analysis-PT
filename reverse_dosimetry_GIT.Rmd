@@ -17,7 +17,7 @@ knitr::opts_chunk$set(
 
 ``` 
 
-First morning urine (FMU) samples were collected from 83 individuals selected from the INSEF-ExpoQuim survey (Gilles et al., 2022; Govarts et al., 2023) between May 2019-2020. Sample were analysed for the quantification of multiple mycotoxins, including tenuazonic acid (TA) and deoxynivalenol, that showed to be the most occurent mycotoxins in the cohort. The current script aims to analyse the risk connected with DON and TA exposure in terms of HQ based on the defined tollerable daily intake (TDI) and threshold of toxicological concert (TTC), respectively. The script uses urinary concentrations expressed both as ng/mL and ng/mg creatinine (crea). The risk is calculate considering the FMU both as representative for the daily excretion (FMU approach) or as fraction of the daily excretion (24h approach).
+First morning urine (FMU) samples were collected from 295 individuals selected from the INSEF-ExpoQuim survey (Gilles et al., 2022; Govarts et al., 2023) between May 2019-2020. Sample were analysed for the quantification of multiple mycotoxins, including tenuazonic acid (TA) and deoxynivalenol, that showed to be the most occurent mycotoxins in the cohort. The current script aims to analyse the risk connected with DON and TA exposure in terms of HQ based on the defined tollerable daily intake (TDI) and threshold of toxicological concert (TTC), respectively. The script uses urinary concentrations expressed both as ng/mL and ng/mg creatinine (crea). The risk is calculate considering the FMU both as representative for the daily excretion (FMU approach) or as fraction of the daily excretion (24h approach).
 
 ```{r libraries, include = FALSE}
 
